@@ -1,4 +1,5 @@
 import logging
+import json
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -8,7 +9,7 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_TOKEN, CHAT_ID
-from gemini_handler import GeminiHandler
+from llm_handler import LLMHandler
 from calendar_handler import get_events, create_event
 from drive_handler import search_file, read_sheet
 from health import start_health_server
@@ -20,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-gemini = GeminiHandler()
+llm = LLMHandler()
 
 TOOL_HANDLERS = {
     "get_calendar_events": lambda args: get_events(
@@ -41,48 +42,35 @@ TOOL_HANDLERS = {
 }
 
 
-def run_tool_loop(handler: GeminiHandler, max_turns: int = 5) -> str:
+def run_tool_loop(max_turns: int = 5) -> str:
     for _ in range(max_turns):
-        try:
-            response = handler.chat.last
-        except Exception:
-            break
+        calls = llm.tool_calls
+        if not calls:
+            return llm._last_content or ""
 
-        if not response.candidates:
-            break
+        results = []
+        for tc in calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
 
-        parts = response.candidates[0].content.parts
-        has_tool_calls = False
-        tool_results = []
+            logger.info(f"Tool call: {name}({args})")
+            func = TOOL_HANDLERS.get(name)
+            if func:
+                try:
+                    result = func(args)
+                except Exception as e:
+                    result = f"Error: {e}"
+            else:
+                result = f"Funcion {name} no encontrada"
 
-        for part in parts:
-            if part.function_call:
-                has_tool_calls = True
-                fn = part.function_call
-                name = fn.name
-                args = {k: v for k, v in fn.args.items()}
-                logger.info(f"Tool call: {name}({args})")
+            results.append({"tool_call_id": tc.id, "content": str(result)})
 
-                func = TOOL_HANDLERS.get(name)
-                if func:
-                    try:
-                        result = func(args)
-                    except Exception as e:
-                        result = f"Error: {e}"
-                else:
-                    result = f"Funcion {name} no encontrada"
+        llm.submit_results(results)
 
-                tool_results.append({"name": name, "result": result})
-
-        if not has_tool_calls:
-            return response.text
-
-        response = handler.resend_with_tool_result(tool_results)
-
-    try:
-        return response.text
-    except Exception:
-        return "No pude procesar eso. Preguntame de nuevo."
+    return llm._last_content or "No pude procesar eso. Preguntame de nuevo."
 
 
 async def start(update: Update, context):
@@ -94,7 +82,7 @@ async def start(update: Update, context):
 
 
 async def reset(update: Update, context):
-    gemini.reset()
+    llm.reset()
     await update.message.reply_text("Listo, empezamos de nuevo.")
 
 
@@ -106,8 +94,8 @@ async def handle_message(update: Update, context):
     logger.info(f"Mensaje: {user_text}")
 
     try:
-        response = gemini.send_message(user_text)
-        text = run_tool_loop(gemini)
+        llm.send_message(user_text)
+        text = run_tool_loop()
         await update.message.reply_text(text)
     except Exception as e:
         logger.error(f"Error procesando mensaje: {e}", exc_info=True)
